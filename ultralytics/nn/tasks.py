@@ -297,6 +297,166 @@ class BaseModel(nn.Module):
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
 
+class MultiTaskModel(BaseModel):
+    """YOLO model for multi-task scenario."""
+
+    def __init__(self, cfg="yolov8n-mt.yaml", ch=3, nc=None, verbose=True) -> None:
+        """Initialize the YOLO multi-task model with the given config and parameters"""
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "WARNING ⚠️ YOLOv9 `Silence` module is deprecated in favor of nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
+        self.stride = []
+
+        count = 0
+        for m in self.model:
+            if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
+                s = 256  # 2x min stride
+                m.inplace = self.inplace
+
+                def _forward(x):
+                    """Performs a forward pass through the model, handling different Detect subclass types accordingly."""
+                    return self.forward(x)[count][0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)[count]
+
+                m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+                self.stride.append(m.stride)
+                m.bias_init()  # only run once
+                count += 1
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        outputs = []
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+
+            if isinstance(m, Detect):
+                # Gathers all output from task head
+                outputs.append(x)
+
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return outputs
+
+    def _profile_one_layer(self, m, x, dt):
+        """
+        Profile the computation time and FLOPs of a single layer of the model on a given input. Appends the results to
+        the provided list.
+
+        Args:
+            m (nn.Module): The layer to be profiled.
+            x (torch.Tensor): The input data to the layer.
+            dt (list): A list to store the computation time of the layer.
+
+        Returns:
+            None
+        """
+        c = isinstance(m, Detect) and isinstance(x, list)  # is task output layer, copy input as inplace fix
+        flops = thop.profile(m, inputs=[x.copy() if c else x], verbose=False)[0] / 1e9 * 2 if thop else 0  # GFLOPs
+        t = time_sync()
+        for _ in range(10):
+            m(x.copy() if c else x)
+        dt.append((time_sync() - t) * 100)
+        if m == self.model[0]:
+            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+        LOGGER.info(f"{dt[-1]:10.2f} {flops:10.2f} {m.np:10.0f}  {m.type}")
+        if c:
+            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+
+    def _apply(self, fn):
+        """
+        Applies a function to all the tensors in the model that are not parameters or registered buffers.
+
+        Args:
+            fn (function): the function to apply to the model
+
+        Returns:
+            (BaseModel): An updated BaseModel object.
+        """
+        self = super()._apply(fn)
+        for m in self.model:
+            if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
+                m.stride = fn(m.stride)
+                m.anchors = fn(m.anchors)
+                m.strides = fn(m.strides)
+        return self
+
+    def _predict_augment(self, x):
+        """Perform augmentations on input image x and return augmented inference and train outputs."""
+        # if getattr(self, "end2end", False) or self.__class__.__name__ != "MultiTaskModel":
+        if True:
+            LOGGER.warning("WARNING ⚠️ Model does not support 'augment=True', reverting to single-scale prediction.")
+            return self._predict_once(x)
+        # img_size = x.shape[-2:]  # height, width
+        # s = [1, 0.83, 0.67]  # scales
+        # f = [None, 3, None]  # flips (2-ud, 3-lr)
+        # y = []  # outputs
+        # for si, fi in zip(s, f):
+        #     xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride[0].max()))
+        #     yi = super().predict(xi)[0]  # forward
+        #     yi = [self._descale_pred(yii, fi, si, img_size) for yii in yi]
+        #     y.append(yi)
+        # y = [self._clip_augmented(yi) for yi in zip(*y)]  # clip augmented tails
+        # return [torch.cat(yi, -1) for yi in y], None  # augmented inference, train
+
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on
+            preds (torch.Tensor | List[torch.Tensor]): Predictions.
+        """
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+        preds = self.forward(batch["img"]) if preds is None else preds
+        losses = [criterion(pred, batch) for criterion, pred in zip(self.critetion, preds)]
+
+        return sum(losses)
+
+    def init_criterion(self):
+        """Initialize the loss critetion for the MultiTaskModel."""
+        return (v8DetectionLoss(self), v8SegmentationLoss(self), v8SegmentationLoss(self))
+
+
 class DetectionModel(BaseModel):
     """YOLOv8 detection model."""
 
